@@ -7,6 +7,8 @@ container before it runs anything, so you get a white screen instead of a
 glitch. Flashbang parses the tag stream first and only damages byte ranges
 that are known to survive.
 
+![Image of the GUI](https://raw.githubusercontent.com/RandomTypek/flashbang/refs/heads/main/gui-simple.png)
+
 ## Safety rules
 
 Every corruption is **length-preserving**, so no offset in the file ever shifts.
@@ -37,9 +39,6 @@ Every corruption is **length-preserving**, so no offset in the file ever shifts.
 `-t all` does all three, each with its own strength.
 
 ## Windows build
-
-There is no prebuilt exe in this repo — PyInstaller cannot cross-compile, so
-the binary has to be produced on Windows. Two ways:
 
 **On your own machine.** Double-click `build_windows.bat`. It needs Python 3.9+
 from python.org with *Add to PATH* ticked, installs PyInstaller itself, and
