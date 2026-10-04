@@ -7,8 +7,6 @@ container before it runs anything, so you get a white screen instead of a
 glitch. Flashbang parses the tag stream first and only damages byte ranges
 that are known to survive.
 
-![Image of the GUI](https://raw.githubusercontent.com/RandomTypek/flashbang/refs/heads/main/gui-simple.png)
-
 ## Safety rules
 
 Every corruption is **length-preserving**, so no offset in the file ever shifts.
@@ -26,7 +24,7 @@ Every corruption is **length-preserving**, so no offset in the file ever shifts.
 
 ## Targets
 
-- **`graphics`** — shape records, morph shapes, fonts, text, buttons, video
+- **`graphics`** — shape records, morph shapes, fonts, buttons, video
   frames, JPEG entropy data, lossless bitmap pixels (decompress → corrupt →
   recompress into the same slot), plus `PlaceObject2/3` matrices and colour
   transforms at the bit level.
@@ -35,8 +33,24 @@ Every corruption is **length-preserving**, so no offset in the file ever shifts.
 - **`logic`** — AS2 `ActionPush` / `ActionConstantPool` literals, and the AS3
   ABC constant pool (doubles + display strings). Numbers drift, on-screen text
   garbles, code keeps running.
+- **`text`** — glyph indices in `DefineText` / `DefineText2` (remapped within
+  each font's glyph count, so "SCORE" jumbles while the tag stays valid) and
+  the initial-text string of `DefineEditText` (printable-only scramble).
+  Symbol names and variable names are left alone.
 
-`-t all` does all three, each with its own strength.
+`-t all` does all four, each with its own strength.
+
+### Sub-modes
+
+These change *how* a target is damaged. Each is opt-in.
+
+- **`--asset-swap`** (graphics) — exchanges `CharacterId`s between placements of
+  the same category (shape↔shape, bitmap↔bitmap). The player becomes a tree;
+  structurally safe because every id stays a valid, same-type id.
+- **`--opswap`** (logic, AS2) — swaps operators for same-length siblings:
+  `+`↔`-`↔`*`↔`/`, `<`↔`>`, `&`↔`|`↔`^`, `>>`↔`>>>`. Gravity goes up, score
+  goes down, win becomes lose. (AVM2/AS3 falls back to constant-pool
+  corruption — safe operator swapping there needs a full bytecode walker.)
 
 ## Windows build
 
@@ -70,21 +84,29 @@ python3 flashbang_gui.py            # or drop a file on it: flashbang_gui.py gam
 `flashbang_gui.py` must sit next to `flashbang.py`. Tkinter only — on Arch that
 means `pacman -S tk`.
 
-It opens in **simple mode**: one *Corruption* slider driving graphics, sound
-and logic together. The `Advanced ▸` link in the corner splits it into a
-per-target slider with on/off switches; `◂ Simple` folds it back. Values carry
-across both ways — simple → advanced copies the dial onto all three, advanced →
-simple averages the enabled ones.
+It opens in **simple mode**: one *Corruption* slider driving all four targets
+together. The `Advanced ▸` link in the corner splits it into a per-target
+slider with on/off switches; `◂ Simple` folds it back. Values carry across both
+ways — simple → advanced copies the dial onto every target, advanced → simple
+averages the enabled ones.
 
 - **Analyse** runs a dry scan and prints the tag inventory plus how many bytes
   each target can actually reach.
 - Once analysed, the slider shows a live estimate (`~1,240 of 812,004 B`) so
   you can dial in the damage before writing anything.
+- **Modes** row — the two sub-modes (asset swap, operator swap) as checkboxes.
+  Toggling one re-analyses, since it changes the corruptible surface.
 - **Randomize** (`Ctrl+R`) rolls the dials and a fresh seed. In simple mode
   that is one number; in advanced mode it switches on a random subset of
   targets — always at least one — and rolls each separately, skipping any
-  target the loaded file cannot reach. Every roll is logged as one pasteable
-  line: `graphics=56 sound=85 logic=off | seed 512979996 | wild off`.
+  target the loaded file cannot reach.
+- **Feed back ↻** uses the last output as the next input, bumping a
+  *generation* counter. One click makes it worse; repeat for a progressive
+  decay arc. Picking a new input by hand resets the lineage.
+- **History** panel — every run with its time, strengths, seed, modes and
+  generation. Double-click or *Restore selected* to load those settings back.
+- Every write is **structure-checked** before it ships; a file that would not
+  load is refused rather than saved.
 - **Open in Ruffle** launches the finished file in the Ruffle desktop player
   the moment it is written. Any Ruffle already running is closed first, so you
   never end up with a pile of windows — including instances Flashbang did not
@@ -99,13 +121,17 @@ simple averages the enabled ones.
 ```
 flashbang.py game.swf --report
 flashbang.py game.swf -o out.swf -t all -s 30
-flashbang.py game.swf -o out.swf -t graphics,sound -s graphics=60,sound=15
+flashbang.py game.swf -o out.swf -t graphics,text -s graphics=60,text=40
+flashbang.py game.swf -o out.swf -t graphics --asset-swap
+flashbang.py game.swf -o out.swf -t logic --opswap -s 100
 ```
 
 | Flag | Meaning |
 |---|---|
-| `-t, --target` | `graphics`, `sound`, `logic`, `all` (comma separated) |
-| `-s, --strength` | `0`–`100`, or per target: `graphics=60,sound=10` |
+| `-t, --target` | `graphics`, `sound`, `logic`, `text`, `all` (comma separated) |
+| `-s, --strength` | `0`–`100`, or per target: `graphics=60,text=40` |
+| `--asset-swap` | graphics: swap same-type character references |
+| `--opswap` | logic: swap operators instead of bytes (AS2) |
 | `--seed N` | Reproducible runs — the same seed gives the same file |
 | `--wild` | Unlocks riskier regions: shape bounds, matrix sign bits, background colour, `DefineBinaryData` |
 | `--report` | Analyse only — tag inventory and corruptible surface, writes nothing |

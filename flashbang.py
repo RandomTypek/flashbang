@@ -32,7 +32,7 @@ import sys
 import zlib
 import lzma
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 # ---------------------------------------------------------------------------
 # tag tables
@@ -72,7 +72,8 @@ UNTOUCHABLE = {
 
 SHAPE_TAGS = {2, 22, 32, 83}
 MORPH_TAGS = {46, 84}
-TEXT_TAGS = {11, 33, 37}
+TEXT_TAGS = {11, 33}          # DefineText / DefineText2 (glyph records)
+EDIT_TEXT_TAGS = {37}         # DefineEditText (has an initial-text string)
 FONT_TAGS = {10, 48, 75}
 BUTTON_TAGS = {7, 34}
 JPEG_TAGS = {6, 21, 35, 90}
@@ -89,14 +90,56 @@ ABC_TAGS = {72, 82}
 
 # how many bytes at the start of a tag body are the character ID
 HAS_CHARACTER_ID = (
-    SHAPE_TAGS | MORPH_TAGS | TEXT_TAGS | FONT_TAGS | BUTTON_TAGS
-    | JPEG_TAGS | LOSSLESS_TAGS | VIDEO_TAGS | SOUND_DEFINE | {39}
+    SHAPE_TAGS | MORPH_TAGS | TEXT_TAGS | EDIT_TEXT_TAGS | FONT_TAGS
+    | BUTTON_TAGS | JPEG_TAGS | LOSSLESS_TAGS | VIDEO_TAGS | SOUND_DEFINE | {39}
 )
+
+# the four corruption targets the tool exposes
+ALL_TARGETS = ("graphics", "sound", "logic", "text")
 
 IDENTIFIER_RE = re.compile(
     r"^[A-Za-z_$][A-Za-z0-9_$]*"
     r"(?:[.:][A-Za-z_$][A-Za-z0-9_$]*)*$"
 )
+
+# ActionScript 2 single-byte operators that can be swapped for a sibling with
+# the same stack effect (pop two, push one; or pop one, push one). Each group
+# lists interchangeable opcodes; a swap keeps the bytecode length identical.
+AS2_OP_GROUPS = [
+    [0x0A, 0x0B, 0x0C, 0x0D],   # add, subtract, multiply, divide (old arith)
+    [0x0E, 0x0F],               # equals, less
+    [0x10, 0x11],               # and, or (logical)
+    [0x12],                     # not (unary) - left alone unless paired
+    [0x47, 0x48, 0x49, 0x4A],   # add2, less2, equals2, toNumber? (SWF6+) *
+    [0x60, 0x61, 0x62, 0x63],   # bitAnd, bitOr, bitXor, bitLShift
+    [0x64, 0x65],               # bitRShift, bitURShift
+    [0x66, 0x67, 0x68],         # strictEquals, greater, stringGreater
+    [0x13, 0x29],               # stringEquals, stringLess
+]
+# binary arithmetic/compare that is genuinely interchangeable (same arity)
+AS2_SWAP = {}
+for _grp in ([0x0A, 0x0B, 0x0C, 0x0D],      # + - * /
+             [0x0E, 0x67],                   # equals <-> greater (both cmp)
+             [0x60, 0x61, 0x62],             # & | ^
+             [0x64, 0x65]):                  # >> >>>
+    for _op in _grp:
+        AS2_SWAP[_op] = [x for x in _grp if x != _op]
+# conditional branch sense: there is only ActionIf (0x9D); flipping it needs
+# operand rewriting, so instead we swap the comparison that feeds it (above).
+
+# ActionScript 3 (AVM2) opcodes, same idea. These are all single-byte with no
+# operands, so a swap is length-safe.
+ABC_SWAP = {}
+for _grp in ([0xA0, 0xA1, 0xA2, 0xA3, 0xA4],  # add subtract multiply divide modulo
+             [0xAB, 0xAD],                     # equals, greaterthan
+             [0xAC, 0xAE],                     # strictequals, greaterequals
+             [0xAF, 0xB0],                     # lessthan, lessequals
+             [0xA8, 0xA9, 0xAA],               # bitand bitor bitxor
+             [0xA5, 0xA6, 0xA7],               # lshift rshift urshift
+             [0x12, 0x13]):                    # iffalse, iftrue (same operand size)
+    for _op in _grp:
+        ABC_SWAP[_op] = [x for x in _grp if x != _op]
+del _grp, _op
 
 
 def looks_like_code(s):
@@ -301,8 +344,12 @@ class Region:
 
     @property
     def size(self):
-        if self.kind == "bits":
+        if self.kind in ("bits", "glyph"):
             return sum(n for _, n in self.spans) // 8 + 1
+        if self.kind == "swap":
+            return sum(len(offs) * 2 for _, offs, _ in self.meta.get("pairs", []))
+        if self.kind == "opswap":
+            return len(self.meta.get("ops", []))
         return self.end - self.start
 
 
@@ -311,15 +358,25 @@ class Region:
 # ---------------------------------------------------------------------------
 
 class Scanner:
-    def __init__(self, swf, targets, wild=False):
+    def __init__(self, swf, targets, wild=False, opts=None):
         self.swf = swf
         self.body = swf.body
         self.targets = targets
+        self.wild = wild
+        # opts carries the optional sub-modes:
+        #   asset_swap    : bool  - swap same-type character refs in placements
+        #   logic_mode    : "bytes" (default) | "opswap"
+        # unknown keys are ignored, so older callers keep working
+        self.opts = opts or {}
         self.wild = wild
         self.regions = []
         self.tag_counts = {}
         self.stream_format = 2          # assume MP3 streaming audio
         self.skipped = []
+        # asset swap needs a second pass once every character is catalogued
+        self.characters = {}            # char_id -> category
+        self.placements = []            # (byte offset of CharacterId, char_id)
+        self.font_glyph_counts = {}     # font_id -> glyph count
 
     def want(self, target):
         return target in self.targets
@@ -327,14 +384,19 @@ class Scanner:
     def scan(self):
         start = header_body_start(self.body)
         self._walk(start, len(self.body))
+        if self.want("graphics") and self.opts.get("asset_swap"):
+            self._build_swap_regions()
         return self.regions
 
     def _walk(self, start, end):
         for code, b0, b1 in iter_tags(self.body, start, end):
             self.tag_counts[code] = self.tag_counts.get(code, 0) + 1
+            self._catalogue(code, b0, b1)
             if code == 39:                       # DefineSprite - recurse
                 # body: SpriteID u16, FrameCount u16, then nested tags
                 if b1 - b0 >= 4:
+                    self.characters[struct.unpack_from("<H", self.body, b0)[0]] \
+                        = "sprite"
                     self._walk(b0 + 4, b1)
                 continue
             if code in UNTOUCHABLE:
@@ -344,6 +406,47 @@ class Scanner:
             except Exception as exc:             # never let one tag kill a run
                 self.skipped.append((code, str(exc)))
 
+    def _catalogue(self, code, b0, b1):
+        """Record each defined character's id and category for asset swapping."""
+        if b1 - b0 < 2:
+            return
+        cid = struct.unpack_from("<H", self.body, b0)[0]
+        if code in SHAPE_TAGS:
+            self.characters[cid] = "shape"
+        elif code in (6, 20, 21, 35, 36, 90):      # bitmaps
+            self.characters[cid] = "bitmap"
+        elif code in TEXT_TAGS or code in EDIT_TEXT_TAGS:
+            self.characters[cid] = "text"
+        elif code in MORPH_TAGS:
+            self.characters[cid] = "morph"
+        elif code in BUTTON_TAGS:
+            self.characters[cid] = "button"
+        elif code in VIDEO_TAGS and code == 60:
+            self.characters[cid] = "video"
+        if code in FONT_TAGS:
+            self.font_glyph_counts[cid] = self._font_glyph_count(code, b0, b1)
+
+    def _font_glyph_count(self, code, b0, b1):
+        """Best-effort glyph count so text glyph indices stay in range."""
+        try:
+            if code == 10:                       # DefineFont: offset table only
+                if b0 + 4 > b1:
+                    return None
+                first = struct.unpack_from("<H", self.body, b0 + 2)[0]
+                return first // 2 if first else None
+            if code in (48, 75):                 # DefineFont2 / 3
+                p = b0 + 2
+                flags = self.body[p]; p += 1
+                p += 1                           # language
+                name_len = self.body[p]; p += 1
+                p += name_len
+                if p + 2 > b1:
+                    return None
+                return struct.unpack_from("<H", self.body, p)[0]
+        except Exception:
+            return None
+        return None
+
     # -- per-tag dispatch ---------------------------------------------------
 
     def _tag(self, code, b0, b1):
@@ -352,18 +455,30 @@ class Scanner:
                 self.stream_format = self.body[b0 + 1] >> 4
             return
 
+        # placements are recorded whenever graphics is active, so asset swap
+        # has something to work with; the matrix/cxform regions come too
+        if self.want("graphics") and code in PLACE_TAGS:
+            self._place(code, b0, b1)
+
+        if self.want("text"):
+            if code in TEXT_TAGS:
+                self._text_glyphs(code, b0, b1)
+            if code in EDIT_TEXT_TAGS:
+                self._edit_text(code, b0, b1)
+
         if self.want("graphics"):
             if code in SHAPE_TAGS:
                 return self._shape(code, b0, b1)
-            if code in MORPH_TAGS or code in TEXT_TAGS or code in FONT_TAGS \
+            if code in MORPH_TAGS or code in FONT_TAGS \
                     or code in BUTTON_TAGS or code in VIDEO_TAGS:
+                return self._generic_character(b0, b1)
+            # text tag glyph shapes are fair game as graphics bytes
+            if code in TEXT_TAGS:
                 return self._generic_character(b0, b1)
             if code in JPEG_TAGS:
                 return self._jpeg(code, b0, b1)
             if code in LOSSLESS_TAGS:
                 return self._lossless(code, b0, b1)
-            if code in PLACE_TAGS:
-                return self._place(code, b0, b1)
             if code == 9 and self.wild:
                 return self._add(Region("bytes", "graphics", b0, b1))
             if code == 87 and self.wild:      # DefineBinaryData
@@ -378,13 +493,14 @@ class Scanner:
                 return self._stream_block(b0, b1)
 
         if self.want("logic"):
+            opswap = self.opts.get("logic_mode") == "opswap"
             if code in ACTION_TAGS:
-                return self._do_action(code, b0, b1)
+                return self._do_action(code, b0, b1, opswap=opswap)
             if code in ABC_TAGS:
-                return self._do_abc(code, b0, b1)
+                return self._do_abc(code, b0, b1, opswap=opswap)
 
     def _add(self, region):
-        if region.size > 0 or region.spans:
+        if region.size > 0 or region.spans or region.meta:
             self.regions.append(region)
 
     # -- graphics -----------------------------------------------------------
@@ -405,6 +521,140 @@ class Scanner:
 
     def _generic_character(self, b0, b1):
         self._add(Region("bytes", "graphics", b0 + 2, b1))
+
+    # -- text ---------------------------------------------------------------
+
+    def _text_glyphs(self, code, b0, b1):
+        """Find the glyph-index bit spans in a DefineText / DefineText2 tag.
+
+        Each text record stores GlyphBits-wide indices into its font's glyph
+        table. Remapping those indices (within range) rearranges which letters
+        draw, so "SCORE" becomes a jumble while the tag stays structurally
+        valid. We record the font in use so the corruptor can keep each index
+        inside the glyph count it saw at define time.
+        """
+        bits = Bits(self.body, b0 + 2)          # skip CharacterId
+        skip_rect(bits)                         # text bounds
+        bits.align()
+        # MATRIX
+        parse_matrix(bits)
+        glyph_bits = bits.read(8)
+        advance_bits = bits.read(8)
+        if glyph_bits == 0 or glyph_bits > 32 or advance_bits > 32:
+            return
+        cur_font_glyphs = None
+        entries = []                            # (bit position, glyph_bits)
+        limit = b1 * 8                          # never read past the tag
+        ok = True
+        while bits.byte_pos < b1:
+            flags = self.body[bits.byte_pos]
+            if flags == 0:
+                break
+            if flags & 0x80:                    # text record header (TEXTRECORD)
+                bits.read(8)
+                has_font = bool(flags & 0x08)
+                has_color = bool(flags & 0x04)
+                has_yoff = bool(flags & 0x02)
+                has_xoff = bool(flags & 0x01)
+                if has_font:
+                    fid = bits.read(16)
+                    cur_font_glyphs = self.font_glyph_counts.get(fid)
+                if has_color:
+                    bits.read(32 if code == 33 else 24)
+                if has_xoff:
+                    bits.read(16)
+                if has_yoff:
+                    bits.read(16)
+                if has_font:
+                    bits.read(16)               # text height
+                if bits.pos > limit:            # header ran off the end
+                    ok = False
+                    break
+            else:                               # glyph record (GLYPHENTRY run)
+                count = bits.read(8)
+                need = count * (glyph_bits + advance_bits)
+                if bits.pos + need > limit:     # run would spill past the tag
+                    ok = False
+                    break
+                for _ in range(count):
+                    gpos = bits.pos
+                    bits.read(glyph_bits)
+                    bits.read(advance_bits)
+                    entries.append((gpos, glyph_bits, cur_font_glyphs))
+                # each TEXTRECORD starts byte-aligned, so realign after a run
+                bits.align()
+        # only keep spans we are certain stay inside the tag; if the parse
+        # desynced, corrupt nothing here rather than risk a neighbouring tag
+        if ok and entries:
+            good = [(p, n, c) for (p, n, c) in entries if p + n <= limit]
+            if len(good) == len(entries):
+                self._add(Region("glyph", "text", b0, b1,
+                                 spans=[(p, n) for p, n, _ in good],
+                                 meta={"caps": [c for _, _, c in good]}))
+
+    def _edit_text(self, code, b0, b1):
+        """Record the InitialText string of a DefineEditText tag, if present."""
+        p = b0 + 2                              # skip CharacterId
+        b = Bits(self.body, p)
+        skip_rect(b)
+        b.align()
+        p = b.byte_pos
+        if p + 2 > b1:
+            return
+        flag1 = self.body[p]
+        flag2 = self.body[p + 1]
+        p += 2
+        has_text = bool(flag1 & 0x80)
+        has_font = bool(flag1 & 0x01)
+        has_font_class = bool(flag2 & 0x80)
+        has_color = bool(flag1 & 0x04)
+        has_maxlen = bool(flag1 & 0x02)
+        has_layout = bool(flag2 & 0x20)
+        if has_font:
+            p += 4                              # FontID + FontHeight
+        if has_font_class:
+            end = self.body.find(b"\x00", p, b1)
+            if end < 0:
+                return
+            p = end + 1
+        if has_color:
+            p += 4                              # RGBA
+        if has_maxlen:
+            p += 2
+        if has_layout:
+            p += 9                              # align + 4 * u16
+        # VariableName (always present): skip it, it is a symbol
+        end = self.body.find(b"\x00", p, b1)
+        if end < 0:
+            return
+        p = end + 1
+        if has_text and p < b1:
+            end = self.body.find(b"\x00", p, b1)
+            if end < 0:
+                end = b1
+            if end > p:
+                self._add(Region("ascii", "text", p, end))
+
+    def _build_swap_regions(self):
+        """Pair up placements that reference same-category characters and
+        emit one swap region that exchanges their CharacterIds in place."""
+        buckets = {}
+        for off, cid in self.placements:
+            cat = self.characters.get(cid)
+            if cat is None:
+                continue
+            buckets.setdefault(cat, []).append((off, cid))
+        pairs = []
+        for cat, items in buckets.items():
+            # distinct target ids within the category
+            ids = sorted({cid for _, cid in items})
+            if len(ids) < 2:
+                continue
+            offs = [off for off, _ in items]
+            pairs.append((cat, offs, ids))
+        if pairs:
+            self._add(Region("swap", "graphics", 0, 0,
+                             meta={"pairs": pairs}))
 
     def _jpeg(self, code, b0, b1):
         pos = b0
@@ -484,15 +734,26 @@ class Scanner:
                     bits.pos += 8
                 bits.pos += 8
         if has_char:
-            bits.read(16)                       # CharacterId - never touched
+            char_off = bits.byte_pos            # byte offset of CharacterId
+            char_id = struct.unpack_from("<H", self.body, char_off)[0]
+            self.placements.append((char_off, char_id))
+            bits.read(16)                       # CharacterId - not byte-corrupted
+        # SWF field order after CharacterId is Matrix, then ColorTransform, then
+        # Ratio, then Name. Matrix and cxform are all we touch and they come
+        # first, so there is no Name to skip here - doing so would eat matrix
+        # bytes and desync every following field.
         spans = []
         if has_matrix:
             spans += parse_matrix(bits)
         if has_cxform:
-            spans += parse_cxform(bits, with_alpha=True)
+            spans += parse_cxform(bits, with_alpha=(code == 70))
+        # keep only spans that stay inside this tag; a misparse never
+        # corrupts a neighbour
+        limit = b1 * 8
+        spans = [(s, n) for (s, n) in spans if s + n <= limit]
         if spans:
             self._add(Region("bits", "graphics", b0, b1, spans=spans))
-        _ = (has_clip_actions, has_clip_depth, has_name, has_ratio)
+        _ = (has_clip_actions, has_clip_depth, has_ratio, has_name)
 
     # -- sound --------------------------------------------------------------
 
@@ -522,14 +783,17 @@ class Scanner:
 
     # -- logic (ActionScript 2) --------------------------------------------
 
-    def _do_action(self, code, b0, b1):
+    def _do_action(self, code, b0, b1, opswap=False):
         pos = b0
         if code == 59:                          # DoInitAction: SpriteID first
             pos += 2
         spans = []
+        ops = []
         while pos < b1:
             op = self.body[pos]
-            if op < 0x80:
+            if op < 0x80:                       # single-byte action, no operand
+                if opswap and op in AS2_SWAP:
+                    ops.append((pos, AS2_SWAP[op]))
                 pos += 1
                 continue
             if pos + 3 > b1:
@@ -537,11 +801,16 @@ class Scanner:
             length = struct.unpack_from("<H", self.body, pos + 1)[0]
             data0 = pos + 3
             data1 = min(data0 + length, b1)
-            if op == 0x96:                      # ActionPush
-                spans += self._push_spans(data0, data1)
-            elif op == 0x88:                    # ActionConstantPool
-                spans += self._pool_spans(data0, data1)
+            if not opswap:
+                if op == 0x96:                  # ActionPush
+                    spans += self._push_spans(data0, data1)
+                elif op == 0x88:                # ActionConstantPool
+                    spans += self._pool_spans(data0, data1)
             pos = data1
+        if opswap:
+            if ops:
+                self._add(Region("opswap", "logic", b0, b1, meta={"ops": ops}))
+            return
         for s, e in spans:
             self._add(Region("bytes", "logic", s, e))
 
@@ -599,7 +868,11 @@ class Scanner:
 
     # -- logic (ActionScript 3 / ABC) --------------------------------------
 
-    def _do_abc(self, code, b0, b1):
+    def _do_abc(self, code, b0, b1, opswap=False):
+        # Operator swapping in AVM2 needs a full method-body bytecode walker to
+        # avoid mistaking operand bytes for opcodes; that is out of scope, so
+        # for ABC we fall back to the safe constant-pool corruption even when
+        # opswap is requested. AS2 (DoAction) gets real operator swaps.
         pos = b0
         if code == 82:
             pos += 4                            # Flags
@@ -665,15 +938,20 @@ def strength_to_p(strength, target):
         # logic regions are tiny (a few bytes per constant), so the same dial
         # position needs a much higher per-byte rate to feel equivalent
         return min(p * 8.0, 0.35)
+    if target == "text":
+        # text is sparse too - a handful of glyphs per field - and people
+        # expect a mid dial to clearly garble it
+        return min(p * 12.0, 0.95)
     return min(p, 0.9)
 
 
 class Corruptor:
-    def __init__(self, body, rng, strengths, wild=False):
+    def __init__(self, body, rng, strengths, wild=False, opts=None):
         self.body = body
         self.rng = rng
         self.strengths = strengths
         self.wild = wild
+        self.opts = opts or {}
         self.stats = {}
 
     def hit(self, target, n=1):
@@ -681,7 +959,14 @@ class Corruptor:
 
     def run(self, regions):
         for r in regions:
-            p = strength_to_p(self.strengths.get(r.target, 0), r.target)
+            s = self.strengths.get(r.target, 0)
+            if r.kind in ("swap", "opswap"):
+                # discrete toggles: a linear rate so a mid dial swaps ~half.
+                # These are opt-in sub-modes, so even a low or zero dial should
+                # visibly do something - floor the rate at 0.5.
+                p = max(0.5, min(1.0, s / 100.0))
+            else:
+                p = strength_to_p(s, r.target)
             if p <= 0:
                 continue
             fn = getattr(self, "_do_" + r.kind)
@@ -736,7 +1021,10 @@ class Corruptor:
         """Flip individual bits inside matrix / colour-transform values."""
         rng = self.rng
         bit_p = min(p * 40.0, 0.5)
+        tag_end_bit = r.end * 8                   # never flip outside the tag
         for bit_start, nbits in r.spans:
+            if bit_start + nbits > tag_end_bit:   # stray span, skip entirely
+                continue
             first = 0 if self.wild else 1        # keep the sign bit sane
             for k in range(first, nbits):
                 if rng.random() < bit_p:
@@ -746,6 +1034,71 @@ class Corruptor:
                         continue
                     self.body[byte_i] ^= 1 << (7 - (idx & 7))
                     self.hit(r.target)
+
+    def _do_glyph(self, r, p):
+        """Remap glyph indices, each kept inside its font's glyph count."""
+        rng = self.rng
+        caps = r.meta.get("caps", [])
+        tag_end_bit = r.end * 8                  # never write past the tag
+        for (bit_start, nbits), cap in zip(r.spans, caps):
+            if bit_start + nbits > tag_end_bit:  # scan recorded a stray span
+                continue
+            if rng.random() >= p:
+                continue
+            hi = (cap - 1) if cap and cap > 1 else ((1 << nbits) - 1)
+            if hi <= 0:
+                continue
+            new = rng.randint(0, hi)
+            self._write_bits(bit_start, nbits, new)
+            self.hit(r.target)
+
+    def _write_bits(self, bit_start, nbits, value):
+        body = self.body
+        for k in range(nbits):
+            bit = (value >> (nbits - 1 - k)) & 1
+            idx = bit_start + k
+            byte_i = idx >> 3
+            if byte_i >= len(body):
+                return
+            mask = 1 << (7 - (idx & 7))
+            if bit:
+                body[byte_i] |= mask
+            else:
+                body[byte_i] &= ~mask & 0xFF
+
+    def _do_swap(self, r, p):
+        """Exchange CharacterIds among same-category placements."""
+        rng = self.rng
+        for cat, offs, ids in r.meta.get("pairs", []):
+            if len(ids) < 2:
+                continue
+            swapped = 0
+            for off in offs:
+                if rng.random() >= p:
+                    continue
+                swapped += self._swap_one(off, ids)
+            if swapped == 0 and offs:
+                # the dice all missed; guarantee at least one visible swap so
+                # turning the feature on is never a no-op
+                self._swap_one(rng.choice(offs), ids)
+
+    def _swap_one(self, off, ids):
+        cur = struct.unpack_from("<H", self.body, off)[0]
+        choices = [i for i in ids if i != cur]
+        if not choices:
+            return 0
+        struct.pack_into("<H", self.body, off, self.rng.choice(choices))
+        self.hit("graphics")
+        return 1
+
+    def _do_opswap(self, r, p):
+        """Swap an operator opcode for its same-length, same-arity sibling."""
+        rng = self.rng
+        for off, alts in r.meta.get("ops", []):
+            if rng.random() >= p:
+                continue
+            self.body[off] = rng.choice(alts)
+            self.hit(r.target)
 
     def _do_zlib(self, r, p):
         """Decompress, corrupt the pixels, recompress back into the same slot.
@@ -814,7 +1167,7 @@ def print_report(swf, scanner, regions):
     print("  corruptible surface")
     if not by_target:
         print("    (nothing - try a different --target)")
-    for target in ("graphics", "sound", "logic"):
+    for target in ALL_TARGETS:
         if target in by_target:
             count, size = by_target[target]
             pct = 100.0 * size / max(len(swf.body), 1)
@@ -841,7 +1194,7 @@ BANNER = r"""
 
 def parse_strengths(spec, targets):
     """Accept either '35' or 'graphics=60,sound=20,logic=5'."""
-    out = {t: 0.0 for t in ("graphics", "sound", "logic")}
+    out = {t: 0.0 for t in ALL_TARGETS}
     spec = str(spec).strip()
     if "=" not in spec:
         val = float(spec)
@@ -859,14 +1212,45 @@ def parse_strengths(spec, targets):
     return out
 
 
+def verify_structure(orig_body, new_body):
+    """Raise if the two bodies do not have identical tag geometry.
+
+    Length-preserving corruption must never change where a tag starts or how
+    long it is; this catches any scan bug that would have shifted the stream.
+    """
+    sa = header_body_start(orig_body)
+    sb = header_body_start(new_body)
+    if orig_body[:sa] != new_body[:sb]:
+        raise ValueError("SWF header changed")
+
+    def walk(body, start, end):
+        n = 0
+        for code, b0, b1 in iter_tags(body, start, end):
+            n += 1
+            if code == 39 and b1 - b0 >= 4:
+                n += walk(body, b0 + 4, b1)
+        return n
+
+    if walk(orig_body, sa, len(orig_body)) != walk(new_body, sb, len(new_body)):
+        raise ValueError("tag count changed")
+    for (ca, a0, a1), (cb, c0, c1) in zip(
+            iter_tags(orig_body, sa, len(orig_body)),
+            iter_tags(new_body, sb, len(new_body))):
+        if (ca, a0, a1) != (cb, c0, c1):
+            raise ValueError("tag geometry changed at %d" % a0)
+
+
 def corrupt_once(path, out_path, targets, strengths, seed, wild, compress,
-                 quiet=False):
+                 quiet=False, opts=None):
     swf = Swf.load(path)
-    scanner = Scanner(swf, targets, wild=wild)
+    original = bytes(swf.body)                    # for the structure check
+    scanner = Scanner(swf, targets, wild=wild, opts=opts)
     regions = scanner.scan()
     rng = random.Random(seed)
-    corruptor = Corruptor(swf.body, rng, strengths, wild=wild)
+    corruptor = Corruptor(swf.body, rng, strengths, wild=wild, opts=opts)
     stats = corruptor.run(regions)
+    # refuse to write a file that would not load - the whole point of the tool
+    verify_structure(original, swf.body)
     written = swf.save(out_path, compress=compress)
     if not quiet:
         hits = sum(stats.values())
@@ -885,18 +1269,24 @@ def main(argv=None):
         epilog="""examples:
   flashbang game.swf --report
   flashbang game.swf -o out.swf -t all -s 30
-  flashbang game.swf -o out.swf -t graphics,sound -s graphics=60,sound=15
+  flashbang game.swf -o out.swf -t graphics,text -s graphics=60,text=40
+  flashbang game.swf -o out.swf -t graphics --asset-swap
+  flashbang game.swf -o out.swf -t logic --opswap -s 100
 """)
     ap.add_argument("input", help="input .swf")
     ap.add_argument("-o", "--output", help="output .swf")
     ap.add_argument("-t", "--target", default="all",
-                    help="graphics, sound, logic, all (comma separated)")
+                    help="graphics, sound, logic, text, all (comma separated)")
     ap.add_argument("-s", "--strength", default="25",
-                    help="0-100, or per-target like graphics=60,sound=10")
+                    help="0-100, or per-target like graphics=60,text=40")
     ap.add_argument("--seed", type=int, default=None,
                     help="RNG seed - same seed gives the same corruption")
     ap.add_argument("--wild", action="store_true",
                     help="unlock riskier regions (bounds, sign bits, bg colour)")
+    ap.add_argument("--asset-swap", action="store_true",
+                    help="graphics: swap same-type character refs in placements")
+    ap.add_argument("--opswap", action="store_true",
+                    help="logic: swap operators (+/-, </>) instead of bytes (AS2)")
     ap.add_argument("--report", action="store_true",
                     help="analyse only, write nothing")
     ap.add_argument("--compress", choices=("keep", "yes", "no"), default="keep",
@@ -909,12 +1299,18 @@ def main(argv=None):
 
     raw_targets = [t.strip().lower() for t in args.target.split(",") if t.strip()]
     if "all" in raw_targets:
-        targets = {"graphics", "sound", "logic"}
+        targets = set(ALL_TARGETS)
     else:
         targets = set(raw_targets)
-    bad = targets - {"graphics", "sound", "logic"}
+    bad = targets - set(ALL_TARGETS)
     if bad:
         ap.error("unknown target(s): %s" % ", ".join(sorted(bad)))
+
+    opts = {}
+    if args.asset_swap:
+        opts["asset_swap"] = True
+    if args.opswap:
+        opts["logic_mode"] = "opswap"
 
     try:
         swf = Swf.load(args.input)
@@ -922,7 +1318,7 @@ def main(argv=None):
         ap.error(str(exc))
 
     if args.report:
-        scanner = Scanner(swf, targets, wild=args.wild)
+        scanner = Scanner(swf, targets, wild=args.wild, opts=opts)
         print_report(swf, scanner, scanner.scan())
         return 0
 
@@ -946,7 +1342,7 @@ def main(argv=None):
 
     out = args.output or "%s_flashbanged%s" % (stem, ext)
     corrupt_once(args.input, out, targets, strengths, seed, args.wild,
-                 compress, args.quiet)
+                 compress, args.quiet, opts=opts)
 
     if not args.quiet:
         print()

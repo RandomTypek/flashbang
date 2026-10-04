@@ -38,7 +38,45 @@ except ImportError:
     sys.stderr.write("flashbang.py must sit next to this script.\n")
     raise
 
-TARGETS = ("graphics", "sound", "logic")
+
+def verify_structure(orig_path, new_path):
+    """Confirm the output still parses as a SWF with the same tag geometry.
+
+    Raises on any mismatch, so a broken file is never silently delivered.
+    """
+    a = fb.Swf.load(orig_path)
+    b = fb.Swf.load(new_path)
+    if a.version != b.version:
+        raise ValueError("version changed")
+    if len(a.body) != len(b.body):
+        raise ValueError("body length changed")
+    if b.file_length != len(b.body) + 8:
+        raise ValueError("fileLength field wrong")
+    sa = fb.header_body_start(a.body)
+    sb = fb.header_body_start(b.body)
+    if a.body[:sa] != b.body[:sb]:
+        raise ValueError("SWF header changed")
+
+    def walk(body, start, end):
+        n = 0
+        for code, b0, b1 in fb.iter_tags(body, start, end):
+            n += 1
+            if code == 39 and b1 - b0 >= 4:
+                n += walk(body, b0 + 4, b1)
+        return n
+
+    if walk(a.body, sa, len(a.body)) != walk(b.body, sb, len(b.body)):
+        raise ValueError("tag count changed")
+    for (ca, a0, a1), (cb, b0, b1) in zip(
+            fb.iter_tags(a.body, sa, len(a.body)),
+            fb.iter_tags(b.body, sb, len(b.body))):
+        if (ca, a0, a1) != (cb, b0, b1):
+            raise ValueError("tag geometry changed")
+
+TARGETS = ("graphics", "sound", "logic", "text")
+
+# default per-target strengths for advanced mode
+DEFAULT_STRENGTH = {"graphics": 30, "sound": 25, "logic": 20, "text": 35}
 
 # --- palette ---------------------------------------------------------------
 BG = "#15161a"
@@ -46,7 +84,8 @@ BG_PANEL = "#1c1e24"
 BG_INPUT = "#0f1013"
 FG = "#d7dae0"
 FG_DIM = "#7c8290"
-ACCENT = {"graphics": "#5aa9ff", "sound": "#ffb454", "logic": "#7ee787"}
+ACCENT = {"graphics": "#5aa9ff", "sound": "#ffb454", "logic": "#7ee787",
+          "text": "#d886ff"}
 DANGER = "#ff5f56"
 
 
@@ -111,6 +150,8 @@ class FlashbangGUI:
         self.analysis = None          # {target: total_bytes}
         self.ruffle_cmd = None        # resolved lazily
         self.ruffle_proc = None       # the instance we launched
+        self.history = []             # list of run snapshots, newest last
+        self.generation = 0           # how many times output was fed back in
 
         root.title("Flashbang")
         for ico in (os.path.join(HERE, "flashbang.ico"),
@@ -122,7 +163,7 @@ class FlashbangGUI:
                     pass                       # non-Windows Tk: ignore
                 break
         root.configure(bg=BG)
-        root.minsize(700, 560)
+        root.minsize(820, 600)
 
         self._style()
         self._build()
@@ -268,7 +309,7 @@ class FlashbangGUI:
                                    font=("TkFixedFont", 8))
         self.simple_est.grid(row=0, column=3, padx=(8, 10))
         tk.Label(self.simple_panel,
-                 text="graphics, sound and logic together",
+                 text="graphics, sound, logic and text together",
                  bg=BG_PANEL, fg=FG_DIM, anchor="w")\
             .grid(row=1, column=0, columnspan=4, sticky="w",
                   padx=12, pady=(0, 10))
@@ -278,7 +319,7 @@ class FlashbangGUI:
         self.adv_panel.columnconfigure(2, weight=1)
         for i, t in enumerate(TARGETS):
             self.on[t] = tk.BooleanVar(value=True)
-            self.strength[t] = tk.DoubleVar(value=[30, 25, 20][i])
+            self.strength[t] = tk.DoubleVar(value=DEFAULT_STRENGTH[t])
             ttk.Checkbutton(self.adv_panel, variable=self.on[t],
                             command=self._refresh_estimates)\
                 .grid(row=i, column=0, padx=(10, 2), pady=8)
@@ -330,9 +371,29 @@ class FlashbangGUI:
                         command=self._ruffle_toggled).pack(side="left",
                                                            padx=(16, 0))
 
-        # log
-        logwrap = ttk.Frame(root)
-        logwrap.grid(row=6, column=0, sticky="nsew", pady=(14, 4), **pad)
+        # sub-modes row
+        self.swap_var = tk.BooleanVar(value=False)
+        self.opswap_var = tk.BooleanVar(value=False)
+        r1 = ttk.Frame(opt, style="Panel.TFrame")
+        r1.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Label(r1, text="Modes", style="PanelDim.TLabel").pack(side="left")
+        ttk.Checkbutton(r1, text="Asset swap", variable=self.swap_var,
+                        command=self._mode_changed).pack(side="left", padx=(8, 14))
+        ttk.Checkbutton(r1, text="Operator swap", variable=self.opswap_var,
+                        command=self._mode_changed).pack(side="left")
+        tk.Label(r1, text="(graphics / logic)", bg=BG_PANEL,
+                 fg=FG_DIM, font=("TkDefaultFont", 8)).pack(side="left",
+                                                            padx=(10, 0))
+
+        # log + history, side by side
+        split = ttk.Frame(root)
+        split.grid(row=6, column=0, sticky="nsew", pady=(14, 4), **pad)
+        split.rowconfigure(0, weight=1)
+        split.columnconfigure(0, weight=3)
+        split.columnconfigure(1, weight=2)
+
+        logwrap = ttk.Frame(split)
+        logwrap.grid(row=0, column=0, sticky="nsew")
         logwrap.rowconfigure(0, weight=1)
         logwrap.columnconfigure(0, weight=1)
         self.log = tk.Text(logwrap, bg=BG_INPUT, fg=FG, bd=0, wrap="none",
@@ -348,6 +409,25 @@ class FlashbangGUI:
         self.log.tag_configure("bad", foreground=DANGER)
         self.log.tag_configure("good", foreground="#7ee787")
 
+        histwrap = ttk.Frame(split)
+        histwrap.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        histwrap.rowconfigure(1, weight=1)
+        histwrap.columnconfigure(0, weight=1)
+        ttk.Label(histwrap, text="HISTORY", style="Head.TLabel")\
+            .grid(row=0, column=0, sticky="w", pady=(0, 4))
+        self.hist_list = tk.Listbox(
+            histwrap, bg=BG_INPUT, fg=FG, bd=0, highlightthickness=0,
+            selectbackground="#2a2d36", selectforeground=FG, activestyle="none",
+            font=("TkFixedFont", 8))
+        self.hist_list.grid(row=1, column=0, sticky="nsew")
+        hsb = ttk.Scrollbar(histwrap, command=self.hist_list.yview)
+        hsb.grid(row=1, column=1, sticky="ns")
+        self.hist_list.configure(yscrollcommand=hsb.set)
+        self.hist_list.bind("<Double-Button-1>", self._restore_history)
+        ttk.Button(histwrap, text="Restore selected",
+                   command=self._restore_history)\
+            .grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+
         # actions
         bar = ttk.Frame(root)
         bar.grid(row=7, column=0, sticky="ew", pady=(4, 14), **pad)
@@ -357,8 +437,11 @@ class FlashbangGUI:
         self.btn_random = ttk.Button(bar, text="Randomize",
                                      command=self.randomize)
         self.btn_random.pack(side="left", padx=6)
+        self.btn_feed = ttk.Button(bar, text="Feed back ↺",
+                                   command=self.feed_back)
+        self.btn_feed.pack(side="left")
         ttk.Button(bar, text="Clear log", command=self.clear_log)\
-            .pack(side="left")
+            .pack(side="left", padx=6)
         self.btn_go = ttk.Button(bar, text="Flashbang it", style="Go.TButton",
                                  command=self.corrupt)
         self.btn_go.pack(side="right")
@@ -367,8 +450,8 @@ class FlashbangGUI:
         self.root.bind("<Control-r>", lambda _e: self.randomize())
         self.root.bind("<Control-Return>", lambda _e: self.corrupt())
         self.write("Pick a .swf and hit Analyse to see what can be broken.\n"
-                   "Randomize (Ctrl+R) rolls a set of settings for you.\n",
-                   "dim")
+                   "Randomize (Ctrl+R) rolls settings. Feed back re-corrupts "
+                   "the last output for progressive decay.\n", "dim")
 
     # -- small helpers ------------------------------------------------------
 
@@ -432,8 +515,117 @@ class FlashbangGUI:
         if os.path.isfile(self.in_var.get().strip()):
             self.analyse()
 
+    def _mode_changed(self):
+        # asset swap changes the corruptible surface, so a fresh analysis
+        # keeps the estimates honest
+        self.analysis = None
+        self._refresh_estimates()
+        if os.path.isfile(self.in_var.get().strip()):
+            self.analyse()
+
+    def _opts(self):
+        """Assemble the engine opts dict from the sub-mode checkboxes."""
+        opts = {}
+        if self.swap_var.get():
+            opts["asset_swap"] = True
+        if self.opswap_var.get():
+            opts["logic_mode"] = "opswap"
+        return opts
+
+    # -- generations + history ---------------------------------------------
+
+    def _snapshot(self, src, out, targets, strengths, seed, wild, opts):
+        import time
+        return {
+            "t": time.strftime("%H:%M:%S"),
+            "src": src, "out": out,
+            "targets": sorted(targets),
+            "strengths": {k: int(v) for k, v in strengths.items()},
+            "seed": seed, "wild": wild, "opts": dict(opts),
+            "simple": self.simple,
+            "simple_level": int(self.simple_strength.get()),
+            "gen": self.generation,
+            "stats": {},
+        }
+
+    def feed_back(self):
+        """Use the last output as the next input: progressive decay."""
+        if self.busy:
+            return
+        last = self.out_var.get().strip()
+        if not last or not os.path.isfile(last):
+            self.write("nothing to feed back - run a corruption first\n", "bad")
+            return
+        self._feeding = True
+        self.generation += 1
+        self.in_var.set(last)
+        self._feeding = False
+        self._autofill_output()
+        self.new_seed()
+        self.analysis = None
+        self.write("\nfed output back in - generation %d\n" % self.generation,
+                   "good")
+        self.analyse()
+
+    def _add_history(self, snap):
+        self.history.append(snap)
+        self._render_history()
+
+    def _render_history(self):
+        lb = self.hist_list
+        lb.delete(0, "end")
+        for snap in reversed(self.history):
+            modes = []
+            if snap["wild"]:
+                modes.append("wild")
+            o = snap["opts"]
+            if o.get("asset_swap"):
+                modes.append("swap")
+            if o.get("logic_mode") == "opswap":
+                modes.append("ops")
+            if snap["simple"]:
+                lvl = "s=%d" % snap["simple_level"]
+            else:
+                lvl = ",".join("%s%d" % (t[0], snap["strengths"][t])
+                               for t in snap["targets"])
+            tag = (" g%d" % snap["gen"]) if snap["gen"] else ""
+            lb.insert("end", "%s  %s  seed %d%s%s" % (
+                snap["t"], lvl, snap["seed"],
+                ("  " + " ".join(modes)) if modes else "", tag))
+
+    def _restore_history(self, _event=None):
+        sel = self.hist_list.curselection()
+        if not sel:
+            return
+        snap = list(reversed(self.history))[sel[0]]
+        self.seed_var.set(str(snap["seed"]))
+        self.wild_var.set(snap["wild"])
+        o = snap["opts"]
+        self.swap_var.set(bool(o.get("asset_swap")))
+        self.opswap_var.set(o.get("logic_mode") == "opswap")
+        self._mode_changed()
+        if snap["simple"]:
+            if not self.simple:
+                self.mode_var.set("simple"); self._apply_mode()
+            self.simple_strength.set(snap["simple_level"])
+            self._on_simple_slide()
+        else:
+            if self.simple:
+                self.mode_var.set("advanced"); self._apply_mode()
+            for t in TARGETS:
+                on = t in snap["targets"]
+                self.on[t].set(on)
+                self.strength[t].set(snap["strengths"].get(t, 0))
+                self._on_slide(t)
+        self.write("restored run from %s (seed %d)\n"
+                   % (snap["t"], snap["seed"]), "dim")
+
     def _input_changed(self):
         self.analysis = None
+        # a manual input change starts a fresh lineage; feed_back sets this flag
+        # so its own programmatic change does not reset the counter
+        if not getattr(self, "_feeding", False):
+            self.generation = 0
         self._refresh_estimates()
 
     def _on_slide(self, t):
@@ -664,6 +856,7 @@ class FlashbangGUI:
         self.btn_go.state(["disabled"])
         self.btn_analyse.state(["disabled"])
         self.btn_random.state(["disabled"])
+        self.btn_feed.state(["disabled"])
         self.prog.pack(side="right", padx=10)
         self.prog.start(12)
         threading.Thread(target=self._wrap, args=(fn,), daemon=True).start()
@@ -690,11 +883,14 @@ class FlashbangGUI:
                     self._refresh_estimates()
                 elif kind == "open":
                     self._open_in_ruffle(payload)
+                elif kind == "history":
+                    self._add_history(payload)
                 elif kind == "done":
                     self.busy = False
                     self.btn_go.state(["!disabled"])
                     self.btn_analyse.state(["!disabled"])
                     self.btn_random.state(["!disabled"])
+                    self.btn_feed.state(["!disabled"])
                     self.prog.stop()
                     self.prog.pack_forget()
         except queue.Empty:
@@ -710,11 +906,12 @@ class FlashbangGUI:
             self.write("error: %s\n" % exc, "bad")
             return
         wild = self.wild_var.get()
-        self._start(lambda: self._do_analyse(src, wild))
+        opts = self._opts()
+        self._start(lambda: self._do_analyse(src, wild, opts))
 
-    def _do_analyse(self, src, wild):
+    def _do_analyse(self, src, wild, opts):
         swf = fb.Swf.load(src)
-        scanner = fb.Scanner(swf, set(TARGETS), wild=wild)
+        scanner = fb.Scanner(swf, set(TARGETS), wild=wild, opts=opts)
         regions = scanner.scan()
         put = self.q.put
         put(("log", ("\n%s\n" % os.path.basename(src), "good")))
@@ -758,28 +955,50 @@ class FlashbangGUI:
         wild = self.wild_var.get()
         comp = {"keep": None, "yes": True, "no": False}[self.comp_var.get()]
         open_after = self.ruffle_var.get()
+        opts = self._opts()
+        snapshot = self._snapshot(src, out, targets, strengths, seed, wild, opts)
         self._start(lambda: self._do_corrupt(src, out, targets, strengths,
-                                             seed, wild, comp, open_after))
+                                             seed, wild, comp, open_after,
+                                             opts, snapshot))
 
     def _do_corrupt(self, src, out, targets, strengths, seed, wild, comp,
-                    open_after=False):
+                    open_after=False, opts=None, snapshot=None):
         put = self.q.put
+        extra = []
+        if wild:
+            extra.append("wild")
+        for k, label in (("asset_swap", "swap"), ("logic_mode", "opswap")):
+            if opts and opts.get(k):
+                extra.append(label)
+        tagline = (" | " + " ".join(extra)) if extra else ""
         put(("log", ("\nseed %d%s | %s\n" % (
-            seed, "  wild" if wild else "", ", ".join(sorted(targets))),
-            "dim")))
+            seed, tagline, ", ".join(sorted(targets))), "dim")))
         swf = fb.Swf.load(src)
-        scanner = fb.Scanner(swf, targets, wild=wild)
+        scanner = fb.Scanner(swf, targets, wild=wild, opts=opts)
         regions = scanner.scan()
         rng = random.Random(seed)
-        stats = fb.Corruptor(swf.body, rng, strengths, wild=wild).run(regions)
+        stats = fb.Corruptor(swf.body, rng, strengths, wild=wild,
+                             opts=opts).run(regions)
         written = swf.save(out, compress=comp)
-        put(("log", ("  %s  " % os.path.basename(out), "good")))
+        # structural self-check: refuse to ship a file that would not load
+        try:
+            verify_structure(src, out)
+            ok = True
+        except Exception as exc:
+            ok = False
+            put(("log", ("  REFUSED: output failed structure check (%s)\n"
+                         % exc, "bad")))
+        put(("log", ("  %s  " % os.path.basename(out), "good" if ok else "bad")))
         detail = "  ".join("%s %d" % (t, stats[t])
                            for t in TARGETS if stats.get(t))
         put(("log", ("%d B   %s\n" % (written, detail or "no hits"), "dim")))
-        put(("log", ("done - same seed reproduces this exactly\n", "dim")))
-        if open_after:
-            put(("open", out))
+        if ok:
+            put(("log", ("done - same seed reproduces this exactly\n", "dim")))
+            if snapshot is not None:
+                snapshot["stats"] = dict(stats)
+                put(("history", snapshot))
+            if open_after:
+                put(("open", out))
 
 
 def main():
